@@ -13,6 +13,11 @@
 //   momentum    = a clamped read of the protocol's 7-day TVL change
 //   maturity    = a rising function of how long the protocol has run with no token
 //   implied     = round( tvl_usd x ratio(cat) x momentum x maturity )
+//   range       = the same arithmetic at the category's lower and upper ratio quartiles,
+//                 each shrunk toward the overall quartile and clamped exactly as the point
+//                 ratio is: implied_low_usd..implied_high_usd is the middle half of what
+//                 the category's trading peers actually fetched, so every row shows not
+//                 only the model's claim but how wide the evidence behind it runs.
 //
 // Protocols whose token already trades are never ranked: they are the yardstick, and the dashboard
 // shows them apart, at the market's own numbers. No protocol name is special-cased anywhere; the
@@ -47,6 +52,8 @@ export interface ModelConstants {
   shrink_k: number;
   winsor_lo: number;
   winsor_hi: number;
+  spread_lo_pct: number;
+  spread_hi_pct: number;
   ratio_floor: number;
   ratio_cap: number;
   momentum_weight: number;
@@ -63,6 +70,8 @@ export const MODEL: ModelConstants = {
   shrink_k: 6,
   winsor_lo: 0.01,
   winsor_hi: 10,
+  spread_lo_pct: 0.25,
+  spread_hi_pct: 0.75,
   ratio_floor: 0.02,
   ratio_cap: 2.5,
   momentum_weight: 0.6,
@@ -75,7 +84,7 @@ export const MODEL: ModelConstants = {
   maturity_horizon_days: 1460,
 };
 
-export const MODEL_VERSION = 'radar-ratio-1';
+export const MODEL_VERSION = 'radar-ratio-2';
 
 /** How many already-trading protocols the dashboard's yardstick view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -99,6 +108,10 @@ export interface BoardRow {
   implied_value_usd: number;
   model: {
     category_ratio: number;
+    ratio_low: number;
+    ratio_high: number;
+    implied_low_usd: number;
+    implied_high_usd: number;
     category_peers: number;
     momentum_factor: number;
     maturity_factor: number;
@@ -133,7 +146,11 @@ export interface BoardDataRow {
   age_days: number | null;
   watchlist: boolean;
   implied_value_usd: number;
+  implied_low_usd: number;
+  implied_high_usd: number;
   category_ratio: number;
+  ratio_low: number;
+  ratio_high: number;
   category_peers: number;
   momentum_factor: number;
   maturity_factor: number;
@@ -185,6 +202,17 @@ export function median(values: number[]): number {
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
+/** The pct quantile of a non-empty list, linearly interpolated on a sorted copy. */
+export function percentile(values: number[], pct: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (sorted.length === 1) return sorted[0]!;
+  const at = clamp(pct, 0, 1) * (sorted.length - 1);
+  const lo = Math.floor(at);
+  const hi = Math.ceil(at);
+  if (lo === hi) return sorted[lo]!;
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (at - lo);
+}
+
 /** Whole days from `listedAt` to `asOf`, never negative; null when a date is missing or unreadable. */
 export function ageDays(asOf: string, listedAt: string | null): number | null {
   if (listedAt === null) return null;
@@ -219,14 +247,26 @@ export function isRankable(p: SnapshotProtocol): boolean {
 /** The realised mcap/TVL ratios of the snapshot's tokenised protocols, overall and per category. */
 export interface RatioTable {
   overall: number;
-  byCategory: Map<string, { peers: number; median: number; ratio: number }>;
+  overallLo: number;
+  overallHi: number;
+  byCategory: Map<string, { peers: number; median: number; ratio: number; lo: number; hi: number }>;
 }
 
 /** Build the ratio table: winsorised category medians, shrunk toward the overall median, clamped. */
 export function ratioTable(protocols: SnapshotProtocol[], model: ModelConstants = MODEL): RatioTable {
   const tokenized = protocols.filter((p) => isTokenized(p) && p.tvl_usd > 0);
   const realised = (p: SnapshotProtocol): number => clamp(p.mcap_usd! / p.tvl_usd, model.winsor_lo, model.winsor_hi);
-  const overall = tokenized.length > 0 ? median(tokenized.map(realised)) : 0;
+  const all = tokenized.map(realised);
+  const overall = all.length > 0 ? median(all) : 0;
+  const overallLo = all.length > 0 ? clamp(percentile(all, model.spread_lo_pct), model.ratio_floor, model.ratio_cap) : 0;
+  const overallHi = all.length > 0 ? clamp(percentile(all, model.spread_hi_pct), model.ratio_floor, model.ratio_cap) : 0;
+  /**
+   * Shrink one raw statistic of an n-member group toward an overall figure, then clamp it.
+   * The quartiles shrink toward the overall quartiles, not the median, so a category with a
+   * single trading peer still gets an honest range: mostly the whole market's middle half.
+   */
+  const shrink = (n: number, x: number, toward: number): number =>
+    clamp((n * x + model.shrink_k * toward) / (n + model.shrink_k), model.ratio_floor, model.ratio_cap);
   const groups = new Map<string, number[]>();
   for (const p of tokenized) {
     if (p.category === null) continue;
@@ -234,22 +274,31 @@ export function ratioTable(protocols: SnapshotProtocol[], model: ModelConstants 
     list.push(realised(p));
     groups.set(p.category, list);
   }
-  const byCategory = new Map<string, { peers: number; median: number; ratio: number }>();
+  const byCategory = new Map<string, { peers: number; median: number; ratio: number; lo: number; hi: number }>();
   for (const [category, ratios] of groups) {
-    const med = median(ratios);
-    const shrunk = (ratios.length * med + model.shrink_k * overall) / (ratios.length + model.shrink_k);
-    byCategory.set(category, { peers: ratios.length, median: med, ratio: clamp(shrunk, model.ratio_floor, model.ratio_cap) });
+    const n = ratios.length;
+    byCategory.set(category, {
+      peers: n,
+      median: median(ratios),
+      ratio: shrink(n, median(ratios), overall),
+      lo: shrink(n, percentile(ratios, model.spread_lo_pct), overallLo),
+      hi: shrink(n, percentile(ratios, model.spread_hi_pct), overallHi),
+    });
   }
-  return { overall, byCategory };
+  return { overall, overallLo, overallHi, byCategory };
 }
 
-/** The ratio one protocol is valued at: its category's shrunk ratio, or the overall median. */
-export function ratioFor(p: SnapshotProtocol, table: RatioTable, model: ModelConstants = MODEL): { ratio: number; peers: number } {
+/** The ratio one protocol is valued at, with its range: its category's, or the overall figures. */
+export function ratioFor(
+  p: SnapshotProtocol,
+  table: RatioTable,
+  model: ModelConstants = MODEL,
+): { ratio: number; lo: number; hi: number; peers: number } {
   if (p.category !== null) {
     const entry = table.byCategory.get(p.category);
-    if (entry !== undefined) return { ratio: entry.ratio, peers: entry.peers };
+    if (entry !== undefined) return { ratio: entry.ratio, lo: entry.lo, hi: entry.hi, peers: entry.peers };
   }
-  return { ratio: clamp(table.overall, model.ratio_floor, model.ratio_cap), peers: 0 };
+  return { ratio: clamp(table.overall, model.ratio_floor, model.ratio_cap), lo: table.overallLo, hi: table.overallHi, peers: 0 };
 }
 
 /** The age the model assumes when a protocol's listing date is unrecorded: the snapshot's median. */
@@ -258,22 +307,44 @@ export function defaultAgeDays(snapshot: Snapshot): number {
   return ages.length > 0 ? Math.round(median(ages)) : 365;
 }
 
-/** The three factors and the implied value one protocol gets under the model. */
+/** The three factors, the implied value and its range, that one protocol gets under the model. */
 export function scoreProtocol(
   p: SnapshotProtocol,
   asOf: string,
   table: RatioTable,
   fallbackAge: number,
   model: ModelConstants = MODEL,
-): { implied: number; ratio: number; peers: number; momentum: number; maturity: number; age: number | null } {
-  const { ratio, peers } = ratioFor(p, table, model);
+): {
+  implied: number;
+  impliedLow: number;
+  impliedHigh: number;
+  ratio: number;
+  ratioLo: number;
+  ratioHi: number;
+  peers: number;
+  momentum: number;
+  maturity: number;
+  age: number | null;
+} {
+  const { ratio, lo, hi, peers } = ratioFor(p, table, model);
   const change = clamp(finite(p.change_7d, 0), model.momentum_min_change, model.momentum_max_change);
   const momentum = clamp(1 + (change / 100) * model.momentum_weight, model.momentum_floor, model.momentum_cap);
   const age = ageDays(asOf, p.listed_at);
   const ageForModel = age ?? fallbackAge;
   const maturity = model.maturity_base + (clamp(ageForModel, 0, model.maturity_horizon_days) / model.maturity_horizon_days) * model.maturity_span;
-  const implied = clamp(Math.round(p.tvl_usd * ratio * momentum * maturity), 1, 100_000_000_000_000);
-  return { implied, ratio, peers, momentum, maturity, age };
+  const at = (r: number): number => clamp(Math.round(p.tvl_usd * r * momentum * maturity), 1, 100_000_000_000_000);
+  return {
+    implied: at(ratio),
+    impliedLow: at(lo),
+    impliedHigh: at(hi),
+    ratio,
+    ratioLo: lo,
+    ratioHi: hi,
+    peers,
+    momentum,
+    maturity,
+    age,
+  };
 }
 
 /**
@@ -310,6 +381,10 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     implied_value_usd: s.implied,
     model: {
       category_ratio: round4(s.ratio),
+      ratio_low: round4(s.ratioLo),
+      ratio_high: round4(s.ratioHi),
+      implied_low_usd: s.impliedLow,
+      implied_high_usd: s.impliedHigh,
       category_peers: s.peers,
       momentum_factor: round4(s.momentum),
       maturity_factor: round4(s.maturity),
@@ -366,7 +441,11 @@ export function buildData(snapshot: Snapshot, board: BoardRow[], model: ModelCon
       age_days: r.age_days,
       watchlist: r.watchlist,
       implied_value_usd: r.implied_value_usd,
+      implied_low_usd: r.model.implied_low_usd,
+      implied_high_usd: r.model.implied_high_usd,
       category_ratio: r.model.category_ratio,
+      ratio_low: r.model.ratio_low,
+      ratio_high: r.model.ratio_high,
       category_peers: r.model.category_peers,
       momentum_factor: r.model.momentum_factor,
       maturity_factor: r.model.maturity_factor,
@@ -380,7 +459,8 @@ export function buildData(snapshot: Snapshot, board: BoardRow[], model: ModelCon
 // Farm plans. Every step names an action, a cost in dollars and a time. The
 // wording is chosen by the protocol's own category and chains, and the figures
 // (capital, gas, hold) by its TVL, its chains and its age: two protocols in
-// different categories, or on different chains, get different plans.
+// different categories, or on different chains, get different plans. The last
+// step of each plan totals the figures the earlier steps injected.
 // ---------------------------------------------------------------------------
 
 /** A rough one-transaction gas cost in dollars for a chain, from the chain's name. */
@@ -573,17 +653,32 @@ function stepString(text: string, cost: string, time: string): string {
   return s;
 }
 
+/** A dollar figure for the totals step: whole dollars when large, cents kept when small. */
+function money(n: number): string {
+  if (n >= 100) return `$${Math.round(n)}`;
+  return `$${n.toFixed(2).replace(/\.?0+$/, '')}`;
+}
+
 /**
- * One protocol's farm plan: six steps from its own record. The wallet setup names its main chain
- * and its gas price; the core and deepen steps are its category's play; the weekly step, the hold
- * (from its age) and the claim hygiene close the plan.
+ * One protocol's farm plan: seven steps from its own record. The wallet setup names its main
+ * chain and its gas price; the core and deepen steps are its category's play; the weekly step,
+ * the hold (from its age) and the claim hygiene follow; and the last step totals the plan from
+ * the very figures the earlier steps injected — capital deployed, gas across every weekly
+ * round of the hold, and the minutes the plan asks for — so the reader sees the whole cost of
+ * the plan before starting it.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
   const chain = p.chains.length > 0 ? p.chains[0]! : 'its main chain';
   const gas = gasForChain(chain);
   const gasText = gas < 1 ? `$${gas.toFixed(2)}` : `$${gas.toFixed(0)}`;
   const capital = capitalFor(p.tvl_usd);
+  const deepenCapital = Math.round(capital / 2);
+  const deployed = capital + deepenCapital;
   const hold = holdDaysFor(age);
+  const weeks = Math.max(1, Math.round(hold / 7));
+  const gasTotal = gas * 3 + gas * weeks;
+  const oneOffMinutes = 10 + 20 + 15;
+  const weeklyMinutes = 10 + 10;
   const play = playFor(p.category);
   const multiChain =
     p.chains.length > 1 ? ` It also runs on ${p.chains[1]}, so keep a little gas there too.` : '';
@@ -598,7 +693,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
       '10 minutes',
     ),
     stepString(play.core(p.name, chain, capital), `$${capital} of capital plus about ${gasText} of gas`, '20 minutes'),
-    stepString(play.deepen(p.name, chain), `about $${Math.round(capital / 2)} more capital plus ${gasText} of gas`, '15 minutes'),
+    stepString(play.deepen(p.name, chain), `about $${deepenCapital} more capital plus ${gasText} of gas`, '15 minutes'),
     stepString(
       `Once a week, ${play.weekly} on ${p.name}, so the wallet's activity spans many weekly snapshots instead of one day.`,
       `about ${gasText} of gas a week`,
@@ -606,13 +701,18 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
     ),
     stepString(
       `Hold every position for at least ${hold} days. ${p.name} has run ${ageText} with no token recorded, and a launch rewards the wallets that were there across snapshots, not the ones that arrived last.`,
-      `the $${capital} stays deployed; leaving early is the expensive move`,
+      `the $${deployed} stays deployed; leaving early is the expensive move`,
       `${hold} days`,
     ),
     stepString(
       `Follow ${p.name}'s official announcements and points page. If a token or a claim opens, claim only from the link the protocol itself publishes, and never pay any site to unlock an allocation. Log the wallet, the dates and every transaction hash as you go.`,
       '$0',
       '10 minutes a week',
+    ),
+    stepString(
+      `Plan totals for ${p.name}: $${deployed} of capital deployed (the $${capital} core position plus $${deepenCapital} to deepen it), about ${money(gasTotal)} of gas and fees across the setup, the two opening moves and ${weeks} weekly rounds, and ${oneOffMinutes} minutes of one-off work plus about ${weeklyMinutes} minutes a week until the hold ends.`,
+      `about ${money(gasTotal)} spent for good; the $${deployed} of capital is deployed, not spent`,
+      `${hold} days end to end`,
     ),
   ];
 }

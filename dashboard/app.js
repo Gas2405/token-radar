@@ -41,6 +41,24 @@
   }
   function fmtFactor(n) { return '×' + Number(n).toFixed(3).replace(/0+$/, '').replace(/\.$/, '.0'); }
 
+  // Category chips: each category gets a stable hue from a fixed palette, hashed from its name.
+  var HUES = [152, 199, 262, 24, 336, 174, 48, 96, 210, 282, 12, 222];
+  function catHue(cat) {
+    var h = 0;
+    for (var i = 0; i < cat.length; i++) h = (h * 31 + cat.charCodeAt(i)) >>> 0;
+    return HUES[h % HUES.length];
+  }
+  function catChip(cat) {
+    var label = cat || 'Uncategorised';
+    return '<span class="catchip" style="--h:' + catHue(label) + '">' + esc(label) + '</span>';
+  }
+  // A small momentum bar beside the 7-day figure: length is the move's size, capped at 50%.
+  function momBar(change) {
+    if (change === null || change === undefined) return '';
+    var w = Math.min(100, Math.round(Math.abs(change) / 50 * 100));
+    return '<span class="mombar"><i class="' + (change < 0 ? 'neg' : '') + '" style="width:' + w + '%"></i></span>';
+  }
+
   // ---- Masthead: the snapshot's own counts and the model, stated in the open. ----
   $('stats').innerHTML =
     '<div><dt>Protocols scanned</dt><dd>' + meta.protocols_scanned + '</dd></div>' +
@@ -55,7 +73,9 @@
     'shrunk toward the overall median ' +
     '(' + meta.overall_ratio.toFixed(3) + ') by head count and clamped to [' + meta.model.ratio_floor + ', ' + meta.model.ratio_cap + ']; ' +
     'momentum reads the 7-day TVL change, maturity the days run with no token. No name is scored by hand. ' +
-    'Model ' + esc(meta.model_version) + '.';
+    'Each value also carries a range: the same arithmetic at the category\'s lower and upper ratio quartiles ' +
+    '(the ' + Math.round(meta.model.spread_lo_pct * 100) + 'th and ' + Math.round(meta.model.spread_hi_pct * 100) + 'th percentiles of its trading peers), ' +
+    'so a row shows how wide the evidence behind its number runs. Model ' + esc(meta.model_version) + '.';
   $('foot').innerHTML =
     '<p>An implied value is this board\'s own claim: what a token would be worth if the protocol\'s record stayed ' +
     'as the snapshot has it. It is not a prediction that a token will be issued, or when. A protocol here records no ' +
@@ -104,7 +124,7 @@
   var BOARD_COLS = [
     { key: 'rank', label: 'Rank', num: true },
     { key: 'name', label: 'Protocol', num: false },
-    { key: 'category', label: 'Category', num: false, nosort: true },
+    { key: 'category', label: 'Category', num: false },
     { key: 'chains', label: 'Chains', num: false, nosort: true },
     { key: 'tvl_usd', label: 'TVL', num: true },
     { key: 'change_7d', label: '7d', num: true },
@@ -153,15 +173,16 @@
     $('count').textContent = list.length + ' of ' + rows.length + ' protocols';
     $('empty').hidden = list.length > 0;
     $('board-body').innerHTML = list.map(function (r) {
-      return '<tr data-slug="' + esc(r.slug) + '">' +
+      return '<tr data-slug="' + esc(r.slug) + '"' + (r.watchlist ? ' class="wl"' : '') + '>' +
         '<td class="num rank">' + r.rank + '</td>' +
         '<td><span class="pname">' + esc(r.name) + '</span>' + (r.watchlist ? '<span class="star">watchlist</span>' : '') +
         '<span class="slug">' + esc(r.slug) + '</span></td>' +
-        '<td class="cat">' + esc(r.category || 'Uncategorised') + '</td>' +
-        '<td class="chains">' + esc(r.chains.slice(0, 3).join(', ')) + (r.chains.length > 3 ? ' +' + (r.chains.length - 3) : '') + '</td>' +
+        '<td>' + catChip(r.category) + '</td>' +
+        '<td class="chains">' + esc(r.chains.slice(0, 2).join(', ')) + (r.chains.length > 2 ? ' +' + (r.chains.length - 2) : '') + '</td>' +
         '<td class="num">' + fmtUsd(r.tvl_usd) + '</td>' +
-        '<td class="num">' + fmtPct(r.change_7d) + '</td>' +
-        '<td class="num implied">' + fmtUsd(r.implied_value_usd) + '</td></tr>';
+        '<td class="num">' + momBar(r.change_7d) + fmtPct(r.change_7d) + '</td>' +
+        '<td class="num"><span class="implied">' + fmtUsd(r.implied_value_usd) + '</span>' +
+        '<span class="rng">' + fmtUsd(r.implied_low_usd) + ' – ' + fmtUsd(r.implied_high_usd) + '</span></td></tr>';
     }).join('');
     bindRowClicks();
   }
@@ -175,7 +196,7 @@
       return '<tr data-live="' + esc(r.slug) + '">' +
         '<td><span class="pname">' + esc(r.name) + '</span>' +
         '<span class="slug">' + esc(r.slug) + (r.symbol ? ' · ' + esc(r.symbol) : '') + '</span></td>' +
-        '<td class="cat">' + esc(r.category || 'Uncategorised') + '</td>' +
+        '<td>' + catChip(r.category) + '</td>' +
         '<td class="num">' + fmtUsd(r.tvl_usd) + '</td>' +
         '<td class="num implied">' + fmtUsd(r.mcap_usd) + '</td>' +
         '<td class="num">' + r.ratio.toFixed(3) + '</td>' +
@@ -194,24 +215,47 @@
   }
 
   // ---- Detail view: the model's inputs for one protocol, and its farm plan. ----
+  function barRow(label, cls, pct, value) {
+    var w = Math.max(0, Math.min(100, Math.round(pct)));
+    return '<div class="mbar-row"><span class="mbar-lab">' + label + '</span>' +
+      '<span class="mbar-track"><span class="mbar-fill ' + cls + '" style="width:' + w + '%"></span></span>' +
+      '<span class="mbar-val">' + value + '</span></div>';
+  }
   function openDetail(slug) {
     var r = bySlug[slug];
     if (!r) return;
     state.selected = slug;
-    var steps = r.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
+    var steps = r.farm_steps.map(function (s) {
+      return '<li' + (s.indexOf('Plan totals') === 0 ? ' class="totals"' : '') + '>' + esc(s) + '</li>';
+    }).join('');
     var chips = r.chains.map(function (c) { return '<span class="chip">' + esc(c) + '</span>'; }).join('');
+    var m = meta.model;
+    var peerNote = r.category_peers > 0
+      ? 'the middle half of the ' + r.category_peers + ' trading peer' + (r.category_peers === 1 ? '' : 's') +
+        ' in ' + esc(r.category || 'its category') + ' runs ' + r.ratio_low.toFixed(3) + ' – ' + r.ratio_high.toFixed(3)
+      : 'no trading peers in its category: the range is the whole market\'s middle half, ' +
+        r.ratio_low.toFixed(3) + ' – ' + r.ratio_high.toFixed(3);
+    var bars =
+      '<div class="mbars">' +
+      barRow('Category ratio', '', r.category_ratio / m.ratio_cap * 100, r.category_ratio.toFixed(3)) +
+      barRow('Momentum', 'mom', r.momentum_factor / m.momentum_cap * 100, fmtFactor(r.momentum_factor)) +
+      barRow('Maturity', 'mat', (r.maturity_factor - m.maturity_base) / m.maturity_span * 100, fmtFactor(r.maturity_factor)) +
+      '<p class="mbar-note">Bars are scaled to each factor\'s own cap in the model; ' + peerNote + '.</p>' +
+      '</div>';
     $('drawer-body').innerHTML =
       '<div class="d-rank">Rank ' + r.rank + ' of ' + rows.length + (r.watchlist ? '<span class="badge">Watchlist</span>' : '') + '</div>' +
       '<h2 class="d-name">' + esc(r.name) + '</h2>' +
       '<div class="d-sub">' + esc(r.slug) + ' · ' + esc(r.category || 'Uncategorised') + ' · records no token in the snapshot</div>' +
       '<div class="d-implied">' + fmtUsdFull(r.implied_value_usd) + '</div>' +
       '<div class="d-implied-label">Implied value, model ' + esc(meta.model_version) + '</div>' +
+      '<div class="d-range">Range <strong>' + fmtUsdFull(r.implied_low_usd) + ' – ' + fmtUsdFull(r.implied_high_usd) + '</strong> at the category\'s ratio quartiles</div>' +
+      bars +
       '<dl class="d-grid">' +
       '<div><dt>TVL</dt><dd>' + fmtUsdFull(r.tvl_usd) + '</dd></div>' +
       '<div><dt>7-day TVL change</dt><dd>' + (r.change_7d === null ? 'unreported' : (r.change_7d > 0 ? '+' : '') + r.change_7d.toFixed(2) + '%') + '</dd></div>' +
       '<div><dt>Tracked since</dt><dd>' + esc(r.listed_at || 'unrecorded') + '</dd></div>' +
       '<div><dt>Age with no token</dt><dd>' + fmtAge(r.age_days) + '</dd></div>' +
-      '<div><dt>Category ratio</dt><dd>' + r.category_ratio.toFixed(3) + ' <span class="chains">(' + (r.category_peers > 0 ? r.category_peers + ' trading peers' : 'overall median') + ')</span></dd></div>' +
+      '<div><dt>Category ratio</dt><dd>' + r.category_ratio.toFixed(3) + ' <span class="chains">(' + (r.category_peers > 0 ? r.category_peers + ' trading peer' + (r.category_peers === 1 ? '' : 's') : 'overall median') + ')</span></dd></div>' +
       '<div><dt>Momentum · maturity</dt><dd>' + fmtFactor(r.momentum_factor) + ' · ' + fmtFactor(r.maturity_factor) + '</dd></div>' +
       '</dl>' +
       '<div class="d-formula">' + fmtUsdFull(r.tvl_usd) + ' × ' + r.category_ratio.toFixed(3) + ' × ' + r.momentum_factor.toFixed(3) + ' × ' + r.maturity_factor.toFixed(3) + ' ≈ ' + fmtUsdFull(r.implied_value_usd) + '</div>' +
@@ -232,9 +276,10 @@
   $('scrim').addEventListener('click', closeDetail);
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeDetail(); });
 
-  // ---- Deep links: #p=<slug> opens a protocol, #f=<category> sets the filter. ----
+  // ---- Deep links: #p=<slug> opens a protocol, #f=<category> sets the filter, #t=live the yardstick. ----
   function syncHash() {
     var parts = [];
+    if (state.tab === 'live') parts.push('t=live');
     if (state.category) parts.push('f=' + encodeURIComponent(state.category));
     if (state.selected) parts.push('p=' + encodeURIComponent(state.selected));
     var hash = parts.length ? '#' + parts.join('&') : '';
@@ -248,9 +293,14 @@
       if (kv.length !== 2) return;
       var key = kv[0];
       var value = decodeURIComponent(kv[1]);
+      if (key === 't' && value === 'live') state.tab = 'live';
       if (key === 'f' && categories.indexOf(value) >= 0) { state.category = value; $('category').value = value; }
       if (key === 'p' && bySlug[value]) state.selected = value;
     });
+  }
+  function applyTab() {
+    $('tab-board').classList.toggle('active', state.tab === 'board');
+    $('tab-live').classList.toggle('active', state.tab === 'live');
   }
 
   // ---- Controls. ----
@@ -262,12 +312,13 @@
   $('tab-live').addEventListener('click', function () { setTab('live'); });
   function setTab(tab) {
     state.tab = tab;
-    $('tab-board').classList.toggle('active', tab === 'board');
-    $('tab-live').classList.toggle('active', tab === 'live');
+    applyTab();
     render();
+    syncHash();
   }
 
   readHash();
+  applyTab();
   render();
   if (state.selected) openDetail(state.selected);
 })();
